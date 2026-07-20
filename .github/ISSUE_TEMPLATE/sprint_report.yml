@@ -1,0 +1,21 @@
+name: Generate Sprint Report
+description: Triggers an automated sprint report with burndown chart
+labels: ["sprint-report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Fill in the sprint name below and submit. A report will be generated and posted as a comment on this issue within ~30 seconds.
+  - type: dropdown
+    id: sprint
+    attributes:
+      label: Sprint
+      description: Which sprint do you want a report for?
+      options:
+        - Sprint 1
+        - Sprint 2
+        - Sprint 3
+        - Sprint 4
+        - Sprint 5
+    validations:
+      required: true

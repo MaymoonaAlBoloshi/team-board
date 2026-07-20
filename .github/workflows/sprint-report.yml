@@ -1,0 +1,198 @@
+name: Sprint Report
+
+on:
+  issues:
+    types: [opened]
+
+jobs:
+  sprint-report:
+    if: contains(toJson(github.event.issue.labels), 'sprint-report')
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Generate sprint report
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const issueNumber = context.issue.number;
+            const body = context.payload.issue.body || '';
+
+            // Parse sprint from issue body (dropdown value)
+            const sprintMatch = body.match(/###\s*Sprint\s*\n+(.+)/);
+            const sprint = sprintMatch ? sprintMatch[1].trim() : null;
+
+            if (!sprint || sprint === '_No response_') {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: issueNumber,
+                body: '❌ Could not parse sprint name from the issue body. Please use the issue template.'
+              });
+              return;
+            }
+
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: issueNumber,
+              body: `⏳ Generating report for **${sprint}**...`
+            });
+
+            // Fetch all issues for this milestone
+            const { data: milestones } = await github.rest.issues.listMilestones({ owner, repo });
+            const milestone = milestones.find(m => m.title === sprint);
+
+            if (!milestone) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: issueNumber,
+                body: `❌ Milestone **${sprint}** not found. Valid sprints: ${milestones.map(m => m.title).join(', ')}`
+              });
+              await github.rest.issues.update({ owner, repo, issue_number: issueNumber, state: 'closed' });
+              return;
+            }
+
+            const allIssues = [];
+            let page = 1;
+            while (true) {
+              const { data } = await github.rest.issues.listForRepo({
+                owner, repo, state: 'all', milestone: milestone.number, per_page: 100, page
+              });
+              if (!data.length) break;
+              allIssues.push(...data.filter(i => !i.pull_request));
+              if (data.length < 100) break;
+              page++;
+            }
+
+            const pointMap = { '1 point':1,'2 points':2,'3 points':3,'5 points':5,'8 points':8,'13 points':13,'21 points':21 };
+            const getPoints = (issue) => {
+              for (const l of issue.labels) {
+                const v = pointMap[l.name];
+                if (v) return v;
+              }
+              return 0;
+            };
+
+            let totalPts = 0, closedPts = 0, openPts = 0;
+            let totalIssues = 0, closedIssues = 0;
+            const assigneeMap = {};
+            const burnByDate = {};
+
+            for (const issue of allIssues) {
+              const pts = getPoints(issue);
+              totalPts += pts;
+              totalIssues++;
+
+              if (issue.state === 'closed') {
+                closedPts += pts;
+                closedIssues++;
+                if (issue.closed_at) {
+                  const d = issue.closed_at.slice(0, 10);
+                  burnByDate[d] = (burnByDate[d] || 0) + pts;
+                }
+              } else {
+                openPts += pts;
+              }
+
+              const assignees = issue.assignees.length ? issue.assignees : [{ login: 'unassigned' }];
+              for (const a of assignees) {
+                if (!assigneeMap[a.login]) assigneeMap[a.login] = { open: 0, closed: 0, issues: [] };
+                if (issue.state === 'closed') assigneeMap[a.login].closed += pts;
+                else assigneeMap[a.login].open += pts;
+                assigneeMap[a.login].issues.push(`#${issue.number}`);
+              }
+            }
+
+            // Build burndown chart using Mermaid xychart
+            const start = new Date(milestone.created_at);
+            const end = new Date(milestone.due_on || new Date());
+            const days = [];
+            for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+              days.push(d.toISOString().slice(0, 10));
+            }
+
+            // Ideal burndown line
+            const idealStep = days.length > 1 ? totalPts / (days.length - 1) : 0;
+            const idealLine = days.map((_, i) => Math.max(0, Math.round((totalPts - idealStep * i) * 10) / 10));
+
+            // Actual remaining per day
+            let remaining = totalPts;
+            const actualLine = days.map(day => {
+              remaining -= (burnByDate[day] || 0);
+              return remaining;
+            });
+
+            // Mermaid only supports up to ~10 x-axis labels cleanly — sample evenly
+            const step = Math.max(1, Math.floor(days.length / 8));
+            const xLabels = days.filter((_, i) => i % step === 0 || i === days.length - 1)
+              .map(d => `"${d.slice(5)}"`)
+              .join(', ');
+            const idealSampled = idealLine.filter((_, i) => i % step === 0 || i === idealLine.length - 1).join(', ');
+            const actualSampled = actualLine.filter((_, i) => i % step === 0 || i === actualLine.length - 1).join(', ');
+
+            // Assignee rows
+            const assigneeRows = Object.entries(assigneeMap)
+              .sort((a, b) => (b[1].open + b[1].closed) - (a[1].open + a[1].closed))
+              .map(([login, d]) => `| @${login} | ${d.closed} | ${d.open} | ${d.open + d.closed} |`)
+              .join('\n');
+
+            // Open issues list
+            const openList = allIssues
+              .filter(i => i.state === 'open')
+              .map(i => `- [ ] #${i.number} — ${i.title} (${getPoints(i)} pts)`)
+              .join('\n') || '_None — sprint complete!_ 🎉';
+
+            const pct = totalPts ? Math.round((closedPts / totalPts) * 100) : 0;
+            const bar = '█'.repeat(Math.round(pct / 5)) + '░'.repeat(20 - Math.round(pct / 5));
+            const due = milestone.due_on ? milestone.due_on.slice(0, 10) : 'No due date';
+
+            const report = `## 🏃 ${sprint} Report
+
+**Due:** ${due} · **Progress:** \`${bar}\` ${pct}%
+
+| Metric | Value |
+|--------|-------|
+| Total issues | ${totalIssues} |
+| Closed | ${closedIssues} ✅ |
+| Remaining | ${totalIssues - closedIssues} 🔵 |
+| Total points | ${totalPts} |
+| Points burned | ${closedPts} |
+| Points remaining | ${openPts} |
+
+---
+
+### 🔥 Burndown Chart
+
+\`\`\`mermaid
+xychart-beta
+  title "${sprint} Burndown"
+  x-axis [${xLabels}]
+  y-axis "Story Points" 0 --> ${totalPts}
+  line [${idealSampled}]
+  line [${actualSampled}]
+\`\`\`
+> Blue line = ideal · Orange line = actual
+
+---
+
+### 👥 By Contributor
+| Assignee | ✅ Closed | 🔵 Open | Total |
+|----------|-----------|---------|-------|
+${assigneeRows}
+
+---
+
+### 📋 Remaining Work
+${openList}
+
+---
+> Generated automatically — close this issue to archive the report.`;
+
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: issueNumber, body: report
+            });
+
+            await github.rest.issues.update({
+              owner, repo, issue_number: issueNumber,
+              title: `📋 ${sprint} Report — ${new Date().toISOString().slice(0, 10)}`,
+              state: 'closed'
+            });
