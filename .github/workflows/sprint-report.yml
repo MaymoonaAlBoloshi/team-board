@@ -50,7 +50,7 @@ jobs:
               return;
             }
 
-            // Fetch all issues for this milestone
+            // Fetch issues for this milestone
             const allIssues = [];
             let page = 1;
             while (true) {
@@ -61,6 +61,38 @@ jobs:
               allIssues.push(...data.filter(i => !i.pull_request));
               if (data.length < 100) break;
               page++;
+            }
+
+            // Fetch project item statuses via GraphQL
+            const projectData = await github.graphql(`
+              query {
+                node(id: "PVT_kwHOApg96c4Bd34f") {
+                  ... on ProjectV2 {
+                    items(first: 100) {
+                      nodes {
+                        content { ... on Issue { number } }
+                        fieldValues(first: 10) {
+                          nodes {
+                            ... on ProjectV2ItemFieldSingleSelectValue {
+                              name
+                              field { ... on ProjectV2SingleSelectField { name } }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `);
+
+            // Build issue number -> status map
+            const statusMap = {};
+            for (const item of projectData.node.items.nodes) {
+              if (!item.content) continue;
+              const num = item.content.number;
+              const statusField = item.fieldValues.nodes.find(f => f.field && f.field.name === 'Status');
+              statusMap[num] = statusField ? statusField.name : 'Todo';
             }
 
             const pointMap = {
@@ -75,27 +107,26 @@ jobs:
             };
             const hasLabel = (issue, name) => issue.labels.some(l => l.name === name);
 
-            // Core metrics
-            let totalPts = 0, closedPts = 0, openPts = 0;
+            const WIP_STATUSES = new Set(['In Progress', 'In Review']);
+
+            let totalPts = 0, closedPts = 0, openPts = 0, wipPts = 0;
             let totalIssues = 0, closedIssues = 0;
             const assigneeMap = {};
             const burnByDate = {};
-            const sizeBuckets = { 1: { open: 0, closed: 0 }, 2: { open: 0, closed: 0 }, 3: { open: 0, closed: 0 }, 5: { open: 0, closed: 0 }, 8: { open: 0, closed: 0 }, 13: { open: 0, closed: 0 }, 21: { open: 0, closed: 0 } };
-
+            const sizeBuckets = { 1: { open:0, closed:0 }, 2: { open:0, closed:0 }, 3: { open:0, closed:0 }, 5: { open:0, closed:0 }, 8: { open:0, closed:0 }, 13: { open:0, closed:0 }, 21: { open:0, closed:0 } };
             const sprintStart = new Date(milestone.created_at);
             const scopeCreep = [];
+            const statusCounts = { Todo: 0, Ready: 0, 'In Progress': 0, 'In Review': 0, Done: 0 };
 
             for (const issue of allIssues) {
               const pts = getPoints(issue);
+              const isClosed = issue.state === 'closed';
+              const status = isClosed ? 'Done' : (statusMap[issue.number] || 'Todo');
               totalPts += pts;
               totalIssues++;
-              const isClosed = issue.state === 'closed';
+              statusCounts[status] = (statusCounts[status] || 0) + 1;
 
-              // Scope creep: added after sprint start
-              const createdAt = new Date(issue.created_at);
-              if (createdAt > sprintStart) {
-                scopeCreep.push(issue);
-              }
+              if (new Date(issue.created_at) > sprintStart) scopeCreep.push(issue);
 
               if (isClosed) {
                 closedPts += pts;
@@ -106,6 +137,7 @@ jobs:
                 }
               } else {
                 openPts += pts;
+                if (WIP_STATUSES.has(status)) wipPts += pts;
               }
 
               if (sizeBuckets[pts]) {
@@ -115,14 +147,18 @@ jobs:
 
               const assignees = issue.assignees.length ? issue.assignees : [{ login: 'unassigned' }];
               for (const a of assignees) {
-                if (!assigneeMap[a.login]) assigneeMap[a.login] = { open: 0, closed: 0, openIssues: [], closedIssues: [] };
+                if (!assigneeMap[a.login]) assigneeMap[a.login] = {
+                  open: 0, closed: 0, openIssues: [], closedIssues: [],
+                  byStatus: { Todo: 0, Ready: 0, 'In Progress': 0, 'In Review': 0, Done: 0 }
+                };
                 if (isClosed) {
                   assigneeMap[a.login].closed += pts;
                   assigneeMap[a.login].closedIssues.push('#' + issue.number);
                 } else {
                   assigneeMap[a.login].open += pts;
-                  assigneeMap[a.login].openIssues.push('#' + issue.number + ' (' + pts + 'pts)');
+                  assigneeMap[a.login].openIssues.push('#' + issue.number + ' [' + status + '] (' + pts + 'pts)');
                 }
+                assigneeMap[a.login].byStatus[status] = (assigneeMap[a.login].byStatus[status] || 0) + pts;
               }
             }
 
@@ -133,8 +169,6 @@ jobs:
             const daysElapsed = Math.max(1, Math.round((now - sprintStart) / msPerDay));
             const daysTotal = sprintEnd ? Math.round((sprintEnd - sprintStart) / msPerDay) : null;
             const daysRemaining = sprintEnd ? Math.max(0, Math.round((sprintEnd - now) / msPerDay)) : null;
-
-            // Working days remaining (Mon-Fri)
             let workingDaysRemaining = 0;
             if (sprintEnd) {
               for (let d = new Date(now); d <= sprintEnd; d.setDate(d.getDate() + 1)) {
@@ -145,17 +179,15 @@ jobs:
 
             const burnRate = closedPts > 0 ? Math.round((closedPts / daysElapsed) * 10) / 10 : 0;
             let projectedFinish = 'N/A';
-            let onTrackEmoji = '';
+            let onTrackNote = '';
             if (burnRate > 0 && openPts > 0) {
               const daysNeeded = Math.ceil(openPts / burnRate);
               const projDate = new Date(now.getTime() + daysNeeded * msPerDay);
               projectedFinish = projDate.toISOString().slice(0, 10);
-              if (sprintEnd) {
-                onTrackEmoji = projDate <= sprintEnd ? ' ✅ on track' : ' ⚠️ at risk';
-              }
+              if (sprintEnd) onTrackNote = projDate <= sprintEnd ? ' (on track)' : ' (at risk)';
             } else if (openPts === 0) {
-              projectedFinish = 'Complete!';
-              onTrackEmoji = ' ✅';
+              projectedFinish = 'Sprint complete';
+              onTrackNote = '';
             }
 
             // Risk flags
@@ -163,114 +195,130 @@ jobs:
             const unassigned = allIssues.filter(i => i.state === 'open' && i.assignees.length === 0);
             const bigUnstarted = allIssues.filter(i => i.state === 'open' && getPoints(i) >= 8);
 
-            // Burndown chart data
+            // Burndown chart — 3 lines: ideal, actual, optimistic (actual minus WIP)
             const days = [];
-            const chartStart = new Date(sprintStart);
             const chartEnd = sprintEnd || now;
-            for (let d = new Date(chartStart); d <= chartEnd; d.setDate(d.getDate() + 1)) {
+            for (let d = new Date(sprintStart); d <= chartEnd; d.setDate(d.getDate() + 1)) {
               days.push(d.toISOString().slice(0, 10));
             }
             const idealStep = days.length > 1 ? totalPts / (days.length - 1) : 0;
             const idealLine = days.map((_, i) => Math.max(0, Math.round((totalPts - idealStep * i) * 10) / 10));
-            let remaining = totalPts;
+            let rem = totalPts;
             const actualLine = days.map(day => {
-              remaining -= (burnByDate[day] || 0);
-              return remaining;
+              rem -= (burnByDate[day] || 0);
+              return rem;
             });
-            const step = Math.max(1, Math.floor(days.length / 8));
-            const indices = days.map((_, i) => i).filter(i => i % step === 0 || i === days.length - 1);
-            const xLabels = indices.map(i => '"' + days[i].slice(5) + '"').join(', ');
-            const idealSampled = indices.map(i => idealLine[i]).join(', ');
-            const actualSampled = indices.map(i => actualLine[i]).join(', ');
+            // Optimistic: today's actual minus all WIP points (if WIP cleared now)
+            const todayStr = now.toISOString().slice(0, 10);
+            const optimisticLine = days.map(day => {
+              const actual = actualLine[days.indexOf(day)];
+              return day >= todayStr ? Math.max(0, actual - wipPts) : actual;
+            });
+
+            const smpl = Math.max(1, Math.floor(days.length / 8));
+            const idx = days.map((_, i) => i).filter(i => i % smpl === 0 || i === days.length - 1);
+            const xLabels = idx.map(i => '"' + days[i].slice(5) + '"').join(', ');
+            const idealSampled = idx.map(i => idealLine[i]).join(', ');
+            const actualSampled = idx.map(i => actualLine[i]).join(', ');
+            const optimisticSampled = idx.map(i => optimisticLine[i]).join(', ');
 
             // Progress bar
             const pct = totalPts ? Math.round((closedPts / totalPts) * 100) : 0;
             const filled = Math.round(pct / 5);
-            const bar = '█'.repeat(filled) + '░'.repeat(20 - filled);
+            const progressBar = '[' + '='.repeat(filled) + '-'.repeat(20 - filled) + '] ' + pct + '%';
             const due = sprintEnd ? sprintEnd.toISOString().slice(0, 10) : 'No due date';
 
-            // Contributor chart data — sorted by total pts descending
+            // Contributor chart
             const contribEntries = Object.entries(assigneeMap)
               .sort((a, b) => (b[1].open + b[1].closed) - (a[1].open + a[1].closed));
             const contribLabels = contribEntries.map(([login]) => '"' + login + '"').join(', ');
             const contribClosed = contribEntries.map(([, d]) => d.closed).join(', ');
             const contribOpen = contribEntries.map(([, d]) => d.open).join(', ');
-            const contribMax = contribEntries.reduce((m, [, d]) => Math.max(m, d.open + d.closed), 0);
+            const contribMax = contribEntries.reduce((m, [, d]) => Math.max(m, d.open + d.closed), 0) || 1;
+
+            // Load analysis
+            const loadRows = contribEntries.map(([login, d]) => {
+              const total = d.open + d.closed;
+              const deliveryRate = total > 0 ? Math.round((d.closed / total) * 100) : 0;
+              const avgPtsPerIssue = (d.openIssues.length + d.closedIssues.length) > 0
+                ? Math.round((total / (d.openIssues.length + d.closedIssues.length)) * 10) / 10
+                : 0;
+              const wip = d.byStatus['In Progress'] + d.byStatus['In Review'];
+              return '| @' + login + ' | ' + total + ' | ' + d.closed + ' | ' + d.open + ' | ' + wip + ' | ' + deliveryRate + '% | ' + avgPtsPerIssue + ' |';
+            }).join('\n');
 
             // Assignee detail rows
-            const assigneeRows = Object.entries(assigneeMap)
-              .sort((a, b) => (b[1].open + b[1].closed) - (a[1].open + a[1].closed))
-              .map(([login, d]) => {
-                const openStr = d.openIssues.length ? d.openIssues.join(', ') : '—';
-                const closedStr = d.closedIssues.length ? d.closedIssues.join(', ') : '—';
-                return '| @' + login + ' | ' + d.closed + ' | ' + d.open + ' | ' + (d.open + d.closed) + ' | ' + closedStr + ' | ' + openStr + ' |';
-              }).join('\n');
+            const assigneeRows = contribEntries.map(([login, d]) => {
+              const openStr = d.openIssues.length ? d.openIssues.join(', ') : '—';
+              const closedStr = d.closedIssues.length ? d.closedIssues.join(', ') : '—';
+              return '| @' + login + ' | ' + d.closed + ' | ' + d.open + ' | ' + (d.open + d.closed) + ' | ' + closedStr + ' | ' + openStr + ' |';
+            }).join('\n');
 
-            // Size distribution rows
+            // Size rows
             const sizeRows = Object.entries(sizeBuckets)
               .filter(([, v]) => v.open + v.closed > 0)
-              .map(([pts, v]) => '| ' + pts + ' | ' + v.closed + ' | ' + v.open + ' | ' + (v.open + v.closed) + ' |')
+              .map(([p, v]) => '| ' + p + ' | ' + v.closed + ' | ' + v.open + ' | ' + (v.open + v.closed) + ' |')
               .join('\n');
 
-            // Scope creep list
+            // Scope creep
             const scopeCreepList = scopeCreep.length
-              ? scopeCreep.map(i => '- #' + i.number + ' — ' + i.title + ' (' + getPoints(i) + ' pts) added ' + i.created_at.slice(0, 10)).join('\n')
-              : '_None — no scope added after sprint start_';
+              ? scopeCreep.map(i => '- #' + i.number + ' — ' + i.title + ' (' + getPoints(i) + ' pts, added ' + i.created_at.slice(0, 10) + ')').join('\n')
+              : 'None';
 
-            // Closed issues list
+            // Issue lists with status
+            const statusBadge = (issue) => {
+              const s = issue.state === 'closed' ? 'Done' : (statusMap[issue.number] || 'Todo');
+              return '[' + s + ']';
+            };
             const closedList = allIssues
               .filter(i => i.state === 'closed')
-              .map(i => '- [x] #' + i.number + ' — ' + i.title + ' (' + getPoints(i) + ' pts)')
-              .join('\n') || '_Nothing closed yet_';
-
-            // Open issues list
+              .map(i => '- [x] #' + i.number + ' ' + statusBadge(i) + ' ' + i.title + ' (' + getPoints(i) + ' pts)')
+              .join('\n') || 'Nothing closed yet';
             const openList = allIssues
               .filter(i => i.state === 'open')
-              .map(i => '- [ ] #' + i.number + ' — ' + i.title + ' (' + getPoints(i) + ' pts)')
-              .join('\n') || '_None — sprint complete!_';
+              .map(i => '- [ ] #' + i.number + ' ' + statusBadge(i) + ' ' + i.title + ' (' + getPoints(i) + ' pts)')
+              .join('\n') || 'None — sprint complete';
 
             // Risk section
             const riskLines = [];
-            if (unestimated.length) {
-              riskLines.push('| ⚠️ Unestimated issues | ' + unestimated.map(i => '#' + i.number).join(', ') + ' |');
-            }
-            if (unassigned.length) {
-              riskLines.push('| ⚠️ Unassigned issues | ' + unassigned.map(i => '#' + i.number).join(', ') + ' |');
-            }
-            if (bigUnstarted.length) {
-              riskLines.push('| ⚠️ Large open issues (8+ pts) | ' + bigUnstarted.map(i => '#' + i.number + ' (' + getPoints(i) + 'pts)').join(', ') + ' |');
-            }
+            if (unestimated.length) riskLines.push('| Unestimated issues | ' + unestimated.map(i => '#' + i.number).join(', ') + ' |');
+            if (unassigned.length) riskLines.push('| Unassigned issues | ' + unassigned.map(i => '#' + i.number).join(', ') + ' |');
+            if (bigUnstarted.length) riskLines.push('| Large open issues (8+ pts) | ' + bigUnstarted.map(i => '#' + i.number + ' (' + getPoints(i) + 'pts)').join(', ') + ' |');
             const riskSection = riskLines.length
-              ? '| Risk | Details |\n|------|----------|\n' + riskLines.join('\n')
-              : '_No risk signals detected_';
+              ? '| Risk | Issues |\n|------|--------|\n' + riskLines.join('\n')
+              : 'No risk signals detected';
 
             const lines = [
-              '## ' + sprint + ' Report',
+              '## ' + sprint + ' — Sprint Report',
               '',
-              '**Due:** ' + due + ' &nbsp;|&nbsp; **Days elapsed:** ' + daysElapsed + (daysTotal ? ' / ' + daysTotal : '') + ' &nbsp;|&nbsp; **Days remaining:** ' + (daysRemaining !== null ? daysRemaining + ' calendar / ' + workingDaysRemaining + ' working' : 'N/A'),
+              '**Due:** ' + due + ' | **Days elapsed:** ' + daysElapsed + (daysTotal ? ' / ' + daysTotal : '') + ' | **Calendar days remaining:** ' + (daysRemaining !== null ? daysRemaining : 'N/A') + ' | **Working days remaining:** ' + workingDaysRemaining,
               '',
-              '**Progress:** `' + bar + '` ' + pct + '%',
+              '**Progress:** `' + progressBar + '`',
               '',
               '| Metric | Value |',
               '|--------|-------|',
               '| Total issues | ' + totalIssues + ' |',
-              '| Closed issues | ' + closedIssues + ' ✅ |',
-              '| Remaining issues | ' + (totalIssues - closedIssues) + ' 🔵 |',
+              '| Done | ' + statusCounts['Done'] + ' |',
+              '| In Review | ' + (statusCounts['In Review'] || 0) + ' |',
+              '| In Progress | ' + (statusCounts['In Progress'] || 0) + ' |',
+              '| Ready | ' + (statusCounts['Ready'] || 0) + ' |',
+              '| Todo | ' + (statusCounts['Todo'] || 0) + ' |',
               '| Total points | ' + totalPts + ' |',
               '| Points burned | ' + closedPts + ' |',
+              '| Points in WIP | ' + wipPts + ' |',
               '| Points remaining | ' + openPts + ' |',
               '| Burn rate | ' + burnRate + ' pts/day |',
-              '| Projected finish | ' + projectedFinish + onTrackEmoji + ' |',
+              '| Projected finish | ' + projectedFinish + onTrackNote + ' |',
               '',
               '---',
               '',
-              '### ⚠️ Risk Signals',
+              '## Risk Signals',
               '',
               riskSection,
               '',
               '---',
               '',
-              '### 🔥 Burndown Chart',
+              '## Burndown Chart',
               '',
               '```mermaid',
               'xychart-beta',
@@ -279,12 +327,21 @@ jobs:
               '  y-axis "Story Points" 0 --> ' + totalPts,
               '  line [' + idealSampled + ']',
               '  line [' + actualSampled + ']',
+              '  line [' + optimisticSampled + ']',
               '```',
-              '> Blue = ideal &nbsp; Orange = actual',
+              '> Line 1 (blue) = ideal | Line 2 (orange) = actual | Line 3 (green) = optimistic (actual minus all In Progress + In Review points)',
               '',
               '---',
               '',
-              '### 👥 Contributor Breakdown',
+              '## Load Analysis',
+              '',
+              '| Assignee | Total pts | Closed pts | Open pts | WIP pts | Delivery rate | Avg pts/issue |',
+              '|----------|-----------|-----------|---------|---------|--------------|---------------|',
+              loadRows,
+              '',
+              '---',
+              '',
+              '## Contributor Chart',
               '',
               '```mermaid',
               'xychart-beta',
@@ -294,7 +351,11 @@ jobs:
               '  bar [' + contribClosed + ']',
               '  bar [' + contribOpen + ']',
               '```',
-              '> Blue bars = closed pts &nbsp; Orange bars = open pts &nbsp; Combined height = total poker points assigned',
+              '> Blue = closed pts | Orange = open pts | Combined height = total poker points assigned',
+              '',
+              '---',
+              '',
+              '## Contributor Breakdown',
               '',
               '| Assignee | Closed pts | Open pts | Total | Closed issues | Open issues |',
               '|----------|-----------|---------|-------|---------------|-------------|',
@@ -302,7 +363,7 @@ jobs:
               '',
               '---',
               '',
-              '### 📦 Points by Issue Size',
+              '## Points by Issue Size',
               '',
               '| Size (pts) | Closed | Open | Total |',
               '|-----------|--------|------|-------|',
@@ -310,19 +371,19 @@ jobs:
               '',
               '---',
               '',
-              '### 🔭 Scope Creep',
+              '## Scope Creep',
               '',
               scopeCreepList,
               '',
               '---',
               '',
-              '### ✅ Completed Issues',
+              '## Completed Issues',
               '',
               closedList,
               '',
               '---',
               '',
-              '### 📋 Remaining Work',
+              '## Remaining Work',
               '',
               openList,
               '',
