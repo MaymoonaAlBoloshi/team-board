@@ -21,7 +21,6 @@ jobs:
             const issueNumber = context.issue.number;
             const body = context.payload.issue.body || '';
 
-            // Parse sprint from issue body (dropdown value from template)
             const sprintMatch = body.match(/###\s*Sprint\s*\n+(.+)/);
             const sprint = sprintMatch ? sprintMatch[1].trim() : null;
 
@@ -38,7 +37,6 @@ jobs:
               body: 'Generating report for **' + sprint + '**...'
             });
 
-            // Find milestone
             const { data: milestones } = await github.rest.issues.listMilestones({ owner, repo });
             const milestone = milestones.find(m => m.title === sprint);
 
@@ -75,18 +73,31 @@ jobs:
               }
               return 0;
             };
+            const hasLabel = (issue, name) => issue.labels.some(l => l.name === name);
 
+            // Core metrics
             let totalPts = 0, closedPts = 0, openPts = 0;
             let totalIssues = 0, closedIssues = 0;
             const assigneeMap = {};
             const burnByDate = {};
+            const sizeBuckets = { 1: { open: 0, closed: 0 }, 2: { open: 0, closed: 0 }, 3: { open: 0, closed: 0 }, 5: { open: 0, closed: 0 }, 8: { open: 0, closed: 0 }, 13: { open: 0, closed: 0 }, 21: { open: 0, closed: 0 } };
+
+            const sprintStart = new Date(milestone.created_at);
+            const scopeCreep = [];
 
             for (const issue of allIssues) {
               const pts = getPoints(issue);
               totalPts += pts;
               totalIssues++;
+              const isClosed = issue.state === 'closed';
 
-              if (issue.state === 'closed') {
+              // Scope creep: added after sprint start
+              const createdAt = new Date(issue.created_at);
+              if (createdAt > sprintStart) {
+                scopeCreep.push(issue);
+              }
+
+              if (isClosed) {
                 closedPts += pts;
                 closedIssues++;
                 if (issue.closed_at) {
@@ -97,32 +108,75 @@ jobs:
                 openPts += pts;
               }
 
+              if (sizeBuckets[pts]) {
+                if (isClosed) sizeBuckets[pts].closed++;
+                else sizeBuckets[pts].open++;
+              }
+
               const assignees = issue.assignees.length ? issue.assignees : [{ login: 'unassigned' }];
               for (const a of assignees) {
-                if (!assigneeMap[a.login]) assigneeMap[a.login] = { open: 0, closed: 0 };
-                if (issue.state === 'closed') assigneeMap[a.login].closed += pts;
-                else assigneeMap[a.login].open += pts;
+                if (!assigneeMap[a.login]) assigneeMap[a.login] = { open: 0, closed: 0, openIssues: [], closedIssues: [] };
+                if (isClosed) {
+                  assigneeMap[a.login].closed += pts;
+                  assigneeMap[a.login].closedIssues.push('#' + issue.number);
+                } else {
+                  assigneeMap[a.login].open += pts;
+                  assigneeMap[a.login].openIssues.push('#' + issue.number + ' (' + pts + 'pts)');
+                }
               }
             }
 
-            // Build burndown data
-            const start = new Date(milestone.created_at);
-            const end = milestone.due_on ? new Date(milestone.due_on) : new Date();
-            const days = [];
-            for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
-              days.push(d.toISOString().slice(0, 10));
+            // Dates & velocity
+            const now = new Date();
+            const sprintEnd = milestone.due_on ? new Date(milestone.due_on) : null;
+            const msPerDay = 1000 * 60 * 60 * 24;
+            const daysElapsed = Math.max(1, Math.round((now - sprintStart) / msPerDay));
+            const daysTotal = sprintEnd ? Math.round((sprintEnd - sprintStart) / msPerDay) : null;
+            const daysRemaining = sprintEnd ? Math.max(0, Math.round((sprintEnd - now) / msPerDay)) : null;
+
+            // Working days remaining (Mon-Fri)
+            let workingDaysRemaining = 0;
+            if (sprintEnd) {
+              for (let d = new Date(now); d <= sprintEnd; d.setDate(d.getDate() + 1)) {
+                const dow = d.getDay();
+                if (dow !== 0 && dow !== 6) workingDaysRemaining++;
+              }
             }
 
+            const burnRate = closedPts > 0 ? Math.round((closedPts / daysElapsed) * 10) / 10 : 0;
+            let projectedFinish = 'N/A';
+            let onTrackEmoji = '';
+            if (burnRate > 0 && openPts > 0) {
+              const daysNeeded = Math.ceil(openPts / burnRate);
+              const projDate = new Date(now.getTime() + daysNeeded * msPerDay);
+              projectedFinish = projDate.toISOString().slice(0, 10);
+              if (sprintEnd) {
+                onTrackEmoji = projDate <= sprintEnd ? ' ✅ on track' : ' ⚠️ at risk';
+              }
+            } else if (openPts === 0) {
+              projectedFinish = 'Complete!';
+              onTrackEmoji = ' ✅';
+            }
+
+            // Risk flags
+            const unestimated = allIssues.filter(i => i.state === 'open' && hasLabel(i, 'needs estimation'));
+            const unassigned = allIssues.filter(i => i.state === 'open' && i.assignees.length === 0);
+            const bigUnstarted = allIssues.filter(i => i.state === 'open' && getPoints(i) >= 8);
+
+            // Burndown chart data
+            const days = [];
+            const chartStart = new Date(sprintStart);
+            const chartEnd = sprintEnd || now;
+            for (let d = new Date(chartStart); d <= chartEnd; d.setDate(d.getDate() + 1)) {
+              days.push(d.toISOString().slice(0, 10));
+            }
             const idealStep = days.length > 1 ? totalPts / (days.length - 1) : 0;
             const idealLine = days.map((_, i) => Math.max(0, Math.round((totalPts - idealStep * i) * 10) / 10));
-
             let remaining = totalPts;
             const actualLine = days.map(day => {
               remaining -= (burnByDate[day] || 0);
               return remaining;
             });
-
-            // Sample to max 8 labels for clean chart
             const step = Math.max(1, Math.floor(days.length / 8));
             const indices = days.map((_, i) => i).filter(i => i % step === 0 || i === days.length - 1);
             const xLabels = indices.map(i => '"' + days[i].slice(5) + '"').join(', ');
@@ -133,13 +187,33 @@ jobs:
             const pct = totalPts ? Math.round((closedPts / totalPts) * 100) : 0;
             const filled = Math.round(pct / 5);
             const bar = '█'.repeat(filled) + '░'.repeat(20 - filled);
-            const due = milestone.due_on ? milestone.due_on.slice(0, 10) : 'No due date';
+            const due = sprintEnd ? sprintEnd.toISOString().slice(0, 10) : 'No due date';
 
-            // Assignee rows
+            // Assignee detail rows
             const assigneeRows = Object.entries(assigneeMap)
               .sort((a, b) => (b[1].open + b[1].closed) - (a[1].open + a[1].closed))
-              .map(([login, d]) => '| @' + login + ' | ' + d.closed + ' | ' + d.open + ' | ' + (d.open + d.closed) + ' |')
+              .map(([login, d]) => {
+                const openStr = d.openIssues.length ? d.openIssues.join(', ') : '—';
+                const closedStr = d.closedIssues.length ? d.closedIssues.join(', ') : '—';
+                return '| @' + login + ' | ' + d.closed + ' | ' + d.open + ' | ' + (d.open + d.closed) + ' | ' + closedStr + ' | ' + openStr + ' |';
+              }).join('\n');
+
+            // Size distribution rows
+            const sizeRows = Object.entries(sizeBuckets)
+              .filter(([, v]) => v.open + v.closed > 0)
+              .map(([pts, v]) => '| ' + pts + ' | ' + v.closed + ' | ' + v.open + ' | ' + (v.open + v.closed) + ' |')
               .join('\n');
+
+            // Scope creep list
+            const scopeCreepList = scopeCreep.length
+              ? scopeCreep.map(i => '- #' + i.number + ' — ' + i.title + ' (' + getPoints(i) + ' pts) added ' + i.created_at.slice(0, 10)).join('\n')
+              : '_None — no scope added after sprint start_';
+
+            // Closed issues list
+            const closedList = allIssues
+              .filter(i => i.state === 'closed')
+              .map(i => '- [x] #' + i.number + ' — ' + i.title + ' (' + getPoints(i) + ' pts)')
+              .join('\n') || '_Nothing closed yet_';
 
             // Open issues list
             const openList = allIssues
@@ -147,24 +221,48 @@ jobs:
               .map(i => '- [ ] #' + i.number + ' — ' + i.title + ' (' + getPoints(i) + ' pts)')
               .join('\n') || '_None — sprint complete!_';
 
-            // Build report using string concatenation to avoid multiline template issues
+            // Risk section
+            const riskLines = [];
+            if (unestimated.length) {
+              riskLines.push('| ⚠️ Unestimated issues | ' + unestimated.map(i => '#' + i.number).join(', ') + ' |');
+            }
+            if (unassigned.length) {
+              riskLines.push('| ⚠️ Unassigned issues | ' + unassigned.map(i => '#' + i.number).join(', ') + ' |');
+            }
+            if (bigUnstarted.length) {
+              riskLines.push('| ⚠️ Large open issues (8+ pts) | ' + bigUnstarted.map(i => '#' + i.number + ' (' + getPoints(i) + 'pts)').join(', ') + ' |');
+            }
+            const riskSection = riskLines.length
+              ? '| Risk | Details |\n|------|----------|\n' + riskLines.join('\n')
+              : '_No risk signals detected_';
+
             const lines = [
               '## ' + sprint + ' Report',
               '',
-              '**Due:** ' + due + ' &nbsp; **Progress:** `' + bar + '` ' + pct + '%',
+              '**Due:** ' + due + ' &nbsp;|&nbsp; **Days elapsed:** ' + daysElapsed + (daysTotal ? ' / ' + daysTotal : '') + ' &nbsp;|&nbsp; **Days remaining:** ' + (daysRemaining !== null ? daysRemaining + ' calendar / ' + workingDaysRemaining + ' working' : 'N/A'),
+              '',
+              '**Progress:** `' + bar + '` ' + pct + '%',
               '',
               '| Metric | Value |',
               '|--------|-------|',
               '| Total issues | ' + totalIssues + ' |',
-              '| Closed | ' + closedIssues + ' |',
-              '| Remaining | ' + (totalIssues - closedIssues) + ' |',
+              '| Closed issues | ' + closedIssues + ' ✅ |',
+              '| Remaining issues | ' + (totalIssues - closedIssues) + ' 🔵 |',
               '| Total points | ' + totalPts + ' |',
               '| Points burned | ' + closedPts + ' |',
               '| Points remaining | ' + openPts + ' |',
+              '| Burn rate | ' + burnRate + ' pts/day |',
+              '| Projected finish | ' + projectedFinish + onTrackEmoji + ' |',
               '',
               '---',
               '',
-              '### Burndown Chart',
+              '### ⚠️ Risk Signals',
+              '',
+              riskSection,
+              '',
+              '---',
+              '',
+              '### 🔥 Burndown Chart',
               '',
               '```mermaid',
               'xychart-beta',
@@ -174,18 +272,40 @@ jobs:
               '  line [' + idealSampled + ']',
               '  line [' + actualSampled + ']',
               '```',
-              '> Blue = ideal burndown &nbsp; Orange = actual',
+              '> Blue = ideal &nbsp; Orange = actual',
               '',
               '---',
               '',
-              '### By Contributor',
-              '| Assignee | Closed pts | Open pts | Total |',
-              '|----------|-----------|---------|-------|',
+              '### 👥 Contributor Breakdown',
+              '',
+              '| Assignee | Closed pts | Open pts | Total | Closed issues | Open issues |',
+              '|----------|-----------|---------|-------|---------------|-------------|',
               assigneeRows,
               '',
               '---',
               '',
-              '### Remaining Work',
+              '### 📦 Points by Issue Size',
+              '',
+              '| Size (pts) | Closed | Open | Total |',
+              '|-----------|--------|------|-------|',
+              sizeRows,
+              '',
+              '---',
+              '',
+              '### 🔭 Scope Creep',
+              '',
+              scopeCreepList,
+              '',
+              '---',
+              '',
+              '### ✅ Completed Issues',
+              '',
+              closedList,
+              '',
+              '---',
+              '',
+              '### 📋 Remaining Work',
+              '',
               openList,
               '',
               '---',
