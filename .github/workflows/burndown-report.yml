@@ -18,37 +18,65 @@ jobs:
       - name: Generate burndown data
         uses: actions/github-script@v7
         with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
+            const VALID_POINTS = new Set([1, 2, 3, 5, 8, 13, 21]);
 
-            // Fetch all closed issues with point labels
-            const { data: closed } = await github.rest.issues.listForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              state: 'closed',
-              per_page: 100,
-            });
+            // Read Story Points from project v2 single-select field via GraphQL
+            const projectQuery = await github.graphql(`
+              query {
+                user(login: "${context.repo.owner}") {
+                  projectV2(number: 3) {
+                    items(first: 100) {
+                      nodes {
+                        content {
+                          ... on Issue {
+                            number
+                            state
+                            closedAt
+                          }
+                        }
+                        fieldValues(first: 20) {
+                          nodes {
+                            ... on ProjectV2ItemFieldSingleSelectValue {
+                              name
+                              field { ... on ProjectV2SingleSelectField { name } }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `);
 
-            const pointMap = { '1 point':1,'2 points':2,'3 points':3,'5 points':5,'8 points':8,'13 points':13,'21 points':21 };
+            const items = projectQuery.user.projectV2.items.nodes;
 
-            // Group points burned by date
+            const getPoints = (item) => {
+              const spField = item.fieldValues.nodes.find(
+                f => f.field?.name === 'Story Points'
+              );
+              const val = parseInt(spField?.name || '0', 10);
+              return VALID_POINTS.has(val) ? val : 0;
+            };
+
+            // Points burned per day (closed issues)
             const burned = {};
-            for (const issue of closed) {
-              if (!issue.closed_at) continue;
-              const date = issue.closed_at.slice(0, 10);
-              const pts = issue.labels.reduce((sum, l) => sum + (pointMap[l.name] || 0), 0);
-              burned[date] = (burned[date] || 0) + pts;
-            }
+            let remaining = 0;
 
-            // Fetch open issues for remaining points
-            const { data: open } = await github.rest.issues.listForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              state: 'open',
-              per_page: 100,
-            });
-            const remaining = open.reduce((sum, i) =>
-              sum + i.labels.reduce((s, l) => s + (pointMap[l.name] || 0), 0), 0);
+            for (const item of items) {
+              const issue = item.content;
+              if (!issue) continue;
+              const pts = getPoints(item);
+              if (issue.state === 'CLOSED' && issue.closedAt) {
+                const date = issue.closedAt.slice(0, 10);
+                burned[date] = (burned[date] || 0) + pts;
+              } else {
+                remaining += pts;
+              }
+            }
 
             const report = {
               generated_at: new Date().toISOString(),
