@@ -23,19 +23,20 @@ jobs:
 
             This issue needs a story point estimate before it can enter a sprint.
 
-            **Vote using labels:**
-            | Points | Label |
-            |--------|-------|
-            | 1 | \`1 point\` |
-            | 2 | \`2 points\` |
-            | 3 | \`3 points\` |
-            | 5 | \`5 points\` |
-            | 8 | \`8 points\` |
-            | 13 | \`13 points\` |
-            | 21 | \`21 points\` |
+            **Only use these values** in the Story Points field — no other numbers:
+
+            | Points | Effort |
+            |--------|--------|
+            | **1** | Less than an hour, no unknowns |
+            | **2** | A few hours, straightforward |
+            | **3** | Half a day, minor complexity |
+            | **5** | 1–2 days, some unknowns |
+            | **8** | 3–4 days, significant complexity |
+            | **13** | ~1 week, consider splitting |
+            | **21** | Too big — must be broken down first |
 
             After the team agrees on an estimate:
-            1. Apply the matching label to this issue
-            2. Set the **Story Points** field in the [diy-pocker project](https://github.com/users/MaymoonaAlBoloshi/projects/3)
+            1. Apply the matching label (e.g. \`5 points\`) to this issue
+            2. Set the **Story Points** field in the [diy-pocker project](https://github.com/users/MaymoonaAlBoloshi/projects/3) to the **exact number above**
             3. Remove the \`needs estimation\` label`
             });
