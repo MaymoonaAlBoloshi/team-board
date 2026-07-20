@@ -189,6 +189,14 @@ jobs:
             const bar = '█'.repeat(filled) + '░'.repeat(20 - filled);
             const due = sprintEnd ? sprintEnd.toISOString().slice(0, 10) : 'No due date';
 
+            // Contributor chart data — sorted by total pts descending
+            const contribEntries = Object.entries(assigneeMap)
+              .sort((a, b) => (b[1].open + b[1].closed) - (a[1].open + a[1].closed));
+            const contribLabels = contribEntries.map(([login]) => '"' + login + '"').join(', ');
+            const contribClosed = contribEntries.map(([, d]) => d.closed).join(', ');
+            const contribOpen = contribEntries.map(([, d]) => d.open).join(', ');
+            const contribMax = contribEntries.reduce((m, [, d]) => Math.max(m, d.open + d.closed), 0);
+
             // Assignee detail rows
             const assigneeRows = Object.entries(assigneeMap)
               .sort((a, b) => (b[1].open + b[1].closed) - (a[1].open + a[1].closed))
@@ -277,6 +285,16 @@ jobs:
               '---',
               '',
               '### 👥 Contributor Breakdown',
+              '',
+              '```mermaid',
+              'xychart-beta',
+              '  title "Story Points by Contributor"',
+              '  x-axis [' + contribLabels + ']',
+              '  y-axis "Story Points" 0 --> ' + contribMax,
+              '  bar [' + contribClosed + ']',
+              '  bar [' + contribOpen + ']',
+              '```',
+              '> Blue bars = closed pts &nbsp; Orange bars = open pts &nbsp; Combined height = total poker points assigned',
               '',
               '| Assignee | Closed pts | Open pts | Total | Closed issues | Open issues |',
               '|----------|-----------|---------|-------|---------------|-------------|',
