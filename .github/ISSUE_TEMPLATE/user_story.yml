@@ -1,0 +1,34 @@
+name: User Story
+description: A new feature or user-facing task for sprint planning
+labels: ["needs estimation"]
+body:
+  - type: textarea
+    id: story
+    attributes:
+      label: User Story
+      placeholder: "As a [user], I want [goal] so that [reason]"
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance Criteria
+      placeholder: "- [ ] Criterion 1\n- [ ] Criterion 2"
+    validations:
+      required: true
+  - type: dropdown
+    id: estimate
+    attributes:
+      label: Story Points (poker estimate)
+      description: Leave blank if not yet estimated — use the label after planning
+      options:
+        - "Not estimated"
+        - "1"
+        - "2"
+        - "3"
+        - "5"
+        - "8"
+        - "13"
+        - "21"
+    validations:
+      required: false

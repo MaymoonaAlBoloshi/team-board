@@ -1,0 +1,41 @@
+name: Poker Estimation Reminder
+
+on:
+  issues:
+    types: [opened, reopened]
+
+jobs:
+  label-check:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Add estimation reminder comment
+        if: contains(toJson(github.event.issue.labels), 'needs estimation')
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `## 🃏 Poker Estimation Needed
+
+            This issue needs a story point estimate before it can enter a sprint.
+
+            **Vote using labels:**
+            | Points | Label |
+            |--------|-------|
+            | 1 | \`1 point\` |
+            | 2 | \`2 points\` |
+            | 3 | \`3 points\` |
+            | 5 | \`5 points\` |
+            | 8 | \`8 points\` |
+            | 13 | \`13 points\` |
+            | 21 | \`21 points\` |
+
+            After the team agrees on an estimate:
+            1. Apply the matching label to this issue
+            2. Set the **Story Points** field in the [diy-pocker project](https://github.com/users/MaymoonaAlBoloshi/projects/3)
+            3. Remove the \`needs estimation\` label`
+            });

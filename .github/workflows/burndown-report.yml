@@ -1,0 +1,69 @@
+name: Sprint Burndown Report
+
+on:
+  schedule:
+    # Runs every weekday at 9am UTC
+    - cron: '0 9 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  burndown:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: read
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate burndown data
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+
+            // Fetch all closed issues with point labels
+            const { data: closed } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'closed',
+              per_page: 100,
+            });
+
+            const pointMap = { '1 point':1,'2 points':2,'3 points':3,'5 points':5,'8 points':8,'13 points':13,'21 points':21 };
+
+            // Group points burned by date
+            const burned = {};
+            for (const issue of closed) {
+              if (!issue.closed_at) continue;
+              const date = issue.closed_at.slice(0, 10);
+              const pts = issue.labels.reduce((sum, l) => sum + (pointMap[l.name] || 0), 0);
+              burned[date] = (burned[date] || 0) + pts;
+            }
+
+            // Fetch open issues for remaining points
+            const { data: open } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 100,
+            });
+            const remaining = open.reduce((sum, i) =>
+              sum + i.labels.reduce((s, l) => s + (pointMap[l.name] || 0), 0), 0);
+
+            const report = {
+              generated_at: new Date().toISOString(),
+              remaining_points: remaining,
+              burned_by_date: burned,
+            };
+
+            fs.mkdirSync('.burndown', { recursive: true });
+            fs.writeFileSync('.burndown/latest.json', JSON.stringify(report, null, 2));
+            console.log('Burndown report:', JSON.stringify(report, null, 2));
+
+      - name: Commit burndown data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .burndown/latest.json
+          git diff --cached --quiet || git commit -m "chore: update burndown report [skip ci]"
+          git push
