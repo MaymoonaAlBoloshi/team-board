@@ -17,7 +17,7 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
 
-            // Fetch all issues (open + closed)
+            // Fetch all issues
             const allIssues = [];
             let page = 1;
             while (true) {
@@ -30,37 +30,33 @@ jobs:
               page++;
             }
 
-            const VALID = new Set([1, 2, 3, 5, 8, 13, 21]);
-            const pointMap = { '1 point':1,'2 points':2,'3 points':3,'5 points':5,'8 points':8,'13 points':13,'21 points':21 };
-
+            const pointMap = {
+              '1 point': 1, '2 points': 2, '3 points': 3, '5 points': 5,
+              '8 points': 8, '13 points': 13, '21 points': 21
+            };
             const getPoints = (issue) => {
               for (const l of issue.labels) {
-                const v = pointMap[l.name];
-                if (v) return v;
+                if (pointMap[l.name]) return pointMap[l.name];
               }
               return 0;
             };
 
-            // Overall totals
             let totalOpen = 0, totalClosed = 0;
             const assigneeMap = {};
             const sprintMap = {};
 
             for (const issue of allIssues) {
               const pts = getPoints(issue);
-              const sprint = issue.milestone?.title || 'Unscheduled';
+              const sprint = issue.milestone ? issue.milestone.title : 'Unscheduled';
               const isClosed = issue.state === 'closed';
 
               if (isClosed) totalClosed += pts;
               else totalOpen += pts;
 
-              // Per sprint
-              if (!sprintMap[sprint]) sprintMap[sprint] = { open: 0, closed: 0, total: 0 };
+              if (!sprintMap[sprint]) sprintMap[sprint] = { open: 0, closed: 0 };
               if (isClosed) sprintMap[sprint].closed += pts;
               else sprintMap[sprint].open += pts;
-              sprintMap[sprint].total += pts;
 
-              // Per assignee
               const assignees = issue.assignees.length ? issue.assignees : [{ login: 'unassigned' }];
               for (const a of assignees) {
                 if (!assigneeMap[a.login]) assigneeMap[a.login] = { open: 0, closed: 0 };
@@ -71,66 +67,72 @@ jobs:
 
             const total = totalOpen + totalClosed;
             const pct = total ? Math.round((totalClosed / total) * 100) : 0;
-            const bar = '█'.repeat(Math.round(pct / 5)) + '░'.repeat(20 - Math.round(pct / 5));
+            const filled = Math.round(pct / 5);
+            const bar = '█'.repeat(filled) + '░'.repeat(20 - filled);
 
-            // Sprint table
-            const sprintOrder = ['Sprint 1','Sprint 2','Sprint 3','Sprint 4','Sprint 5','Unscheduled'];
+            const sprintOrder = ['Sprint 1', 'Sprint 2', 'Sprint 3', 'Sprint 4', 'Sprint 5', 'Unscheduled'];
             const sprintRows = sprintOrder
               .filter(s => sprintMap[s])
               .map(s => {
-                const { open, closed, total } = sprintMap[s];
-                const p = total ? Math.round((closed / total) * 100) : 0;
-                return `| ${s} | ${closed} | ${open} | ${total} | ${p}% |`;
+                const { open, closed } = sprintMap[s];
+                const t = open + closed;
+                const p = t ? Math.round((closed / t) * 100) : 0;
+                return '| ' + s + ' | ' + closed + ' | ' + open + ' | ' + t + ' | ' + p + '% |';
               }).join('\n');
 
-            // Assignee table
             const assigneeRows = Object.entries(assigneeMap)
               .sort((a, b) => (b[1].open + b[1].closed) - (a[1].open + a[1].closed))
-              .map(([login, d]) => `| @${login} | ${d.closed} | ${d.open} | ${d.open + d.closed} |`)
+              .map(([login, d]) => '| @' + login + ' | ' + d.closed + ' | ' + d.open + ' | ' + (d.open + d.closed) + ' |')
               .join('\n');
 
             const now = new Date().toUTCString();
-            const body = `## 📊 Overall Project Status
-> Last updated: ${now} · [Refresh](https://github.com/${owner}/${repo}/actions/workflows/overall-status.yml)
+            const runUrl = 'https://github.com/' + owner + '/' + repo + '/actions/workflows/overall-status.yml';
 
-### Progress
-\`${bar}\` **${pct}%** complete
-- ✅ **${totalClosed} pts** closed · 🔵 **${totalOpen} pts** open · 📦 **${total} pts** total
+            const lines = [
+              '## Overall Project Status',
+              '',
+              '> Last updated: ' + now,
+              '',
+              '### Progress',
+              '`' + bar + '` **' + pct + '%** complete',
+              '- **' + totalClosed + ' pts** closed &nbsp; **' + totalOpen + ' pts** open &nbsp; **' + total + ' pts** total',
+              '',
+              '---',
+              '',
+              '### By Sprint',
+              '| Sprint | Closed pts | Open pts | Total | Progress |',
+              '|--------|-----------|---------|-------|----------|',
+              sprintRows,
+              '',
+              '---',
+              '',
+              '### By Contributor',
+              '| Assignee | Closed pts | Open pts | Total |',
+              '|----------|-----------|---------|-------|',
+              assigneeRows,
+              '',
+              '---',
+              '> [Re-run to refresh](' + runUrl + ')'
+            ];
 
----
+            const body = lines.join('\n');
 
-### By Sprint
-| Sprint | ✅ Closed | 🔵 Open | Total | Progress |
-|--------|-----------|---------|-------|----------|
-${sprintRows}
-
----
-
-### By Contributor
-| Assignee | ✅ Closed | 🔵 Open | Total |
-|----------|-----------|---------|-------|
-${assigneeRows}
-
----
-> Generated by [Overall Status workflow](https://github.com/${owner}/${repo}/actions/workflows/overall-status.yml)`;
-
-            // Find existing status issue or create one
-            const { data: issues } = await github.rest.issues.listForRepo({
+            // Update existing status issue or create one
+            const { data: existing } = await github.rest.issues.listForRepo({
               owner, repo, state: 'open', labels: 'status-report', per_page: 1
             });
 
-            if (issues.length) {
+            if (existing.length) {
               await github.rest.issues.update({
-                owner, repo, issue_number: issues[0].number, body
+                owner, repo, issue_number: existing[0].number, body
               });
-              console.log(`Updated status issue #${issues[0].number}`);
+              console.log('Updated status issue #' + existing[0].number);
             } else {
               const { data: created } = await github.rest.issues.create({
                 owner, repo,
-                title: '📊 Project Status (auto-updated)',
+                title: 'Project Status (auto-updated)',
                 body,
                 labels: ['status-report']
               });
-              // Pin it
-              console.log(`Created status issue #${created.number}`);
+              console.log('Created status issue #' + created.number);
             }
