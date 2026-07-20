@@ -13,6 +13,8 @@ jobs:
     steps:
       - name: Generate sprint report
         uses: actions/github-script@v7
+        env:
+          PROJECT_TOKEN: ${{ secrets.PROJECT_TOKEN }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
@@ -63,36 +65,45 @@ jobs:
               page++;
             }
 
-            // Fetch project item statuses via GraphQL
-            const projectData = await github.graphql(`
-              query {
-                node(id: "PVT_kwHOApg96c4Bd34f") {
-                  ... on ProjectV2 {
-                    items(first: 100) {
-                      nodes {
-                        content { ... on Issue { number } }
-                        fieldValues(first: 10) {
+            // Fetch project item statuses via GraphQL (requires project scope — graceful fallback if unavailable)
+            const statusMap = {};
+            try {
+              const projectToken = process.env.PROJECT_TOKEN || process.env.GITHUB_TOKEN;
+              const resp = await fetch('https://api.github.com/graphql', {
+                method: 'POST',
+                headers: { Authorization: 'bearer ' + projectToken, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ query: `
+                  query {
+                    node(id: "PVT_kwHOApg96c4Bd34f") {
+                      ... on ProjectV2 {
+                        items(first: 100) {
                           nodes {
-                            ... on ProjectV2ItemFieldSingleSelectValue {
-                              name
-                              field { ... on ProjectV2SingleSelectField { name } }
+                            content { ... on Issue { number } }
+                            fieldValues(first: 10) {
+                              nodes {
+                                ... on ProjectV2ItemFieldSingleSelectValue {
+                                  name
+                                  field { ... on ProjectV2SingleSelectField { name } }
+                                }
+                              }
                             }
                           }
                         }
                       }
                     }
                   }
+                `})
+              });
+              const projectData = await resp.json();
+              if (projectData.data && projectData.data.node) {
+                for (const item of projectData.data.node.items.nodes) {
+                  if (!item.content) continue;
+                  const statusField = item.fieldValues.nodes.find(f => f.field && f.field.name === 'Status');
+                  statusMap[item.content.number] = statusField ? statusField.name : 'Todo';
                 }
               }
-            `);
-
-            // Build issue number -> status map
-            const statusMap = {};
-            for (const item of projectData.node.items.nodes) {
-              if (!item.content) continue;
-              const num = item.content.number;
-              const statusField = item.fieldValues.nodes.find(f => f.field && f.field.name === 'Status');
-              statusMap[num] = statusField ? statusField.name : 'Todo';
+            } catch (e) {
+              console.log('Could not fetch project statuses — using label-based status only:', e.message);
             }
 
             const pointMap = {
