@@ -2,11 +2,11 @@ name: Sprint Report
 
 on:
   issues:
-    types: [opened]
+    types: [labeled]
 
 jobs:
   sprint-report:
-    if: contains(toJson(github.event.issue.labels), 'sprint-report')
+    if: github.event.label.name == 'sprint-report'
     runs-on: ubuntu-latest
     permissions:
       issues: write
